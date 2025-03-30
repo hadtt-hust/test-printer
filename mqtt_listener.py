@@ -5,24 +5,45 @@ import asyncio
 from pyppeteer import launch
 import aiofiles
 import os
-import subprocess
-import time
 import logging
 import threading
+import sys
+import win32print
+import win32api
+from process_y import process_type_y  # Import the function
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging to write to a file
+logging.basicConfig(filename="log.txt", level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 MQTT_BROKER = "127.0.0.1"  # Broker address
 MQTT_TOPIC = "printer/topic"
 
 queue = asyncio.Queue()  # Print queue
 
+# Get the selected printer from command-line arguments
+selected_printer = sys.argv[1] if len(sys.argv) > 1 else None
+logging.info(f"Selected printer: {selected_printer}")
+
+def is_printer_ready(printer_name):
+    try:
+        hPrinter = win32print.OpenPrinter(printer_name)
+        try:
+            printer_info = win32print.GetPrinter(hPrinter, 2)
+            status = printer_info["Status"]
+            if status == 0:
+                return True
+            else:
+                logging.error(f"Printer status is not ready: {status}")
+                return False
+        finally:
+            win32print.ClosePrinter(hPrinter)
+    except Exception as e:
+        logging.error(f"Error checking printer status: {e}")
+        return False
 
 def on_connect(client, userdata, flags, rc, properties=None):
     logging.info(f"Connected with result code {rc}")
     client.subscribe(MQTT_TOPIC)
-
 
 async def create_html(data):
     try:
@@ -40,6 +61,19 @@ async def create_html(data):
         logging.error(f"Error creating HTML: {e}")
         raise
 
+def print_action(printer, filename):
+    try:
+        PRINTER_DEFAULTS = {"DesiredAccess": win32print.PRINTER_ALL_ACCESS}
+        pHandle = win32print.OpenPrinter(printer, PRINTER_DEFAULTS)
+        properties = win32print.GetPrinter(pHandle, 2)
+        properties['pDevMode'].Copies = 1
+        win32print.SetPrinter(pHandle, 2, properties, 0)
+
+        win32api.ShellExecute(0, "print", filename, None, ".", 0)
+        win32print.ClosePrinter(pHandle)
+        logging.info("Printed successfully")
+    except Exception as e:
+        logging.error(f"Error printing the file: {e}")
 
 async def print_html(browser):
     try:
@@ -63,17 +97,13 @@ async def print_html(browser):
             logging.error("Error: PDF file not found!")
             return
 
-        # Send print command
-        try:
-            if os.name == "nt":  # Windows
-                subprocess.run(
-                    ["powershell", "-Command", f"Start-Process -FilePath '{pdf_path}' -Verb Print"], check=True)
-            else:  # Linux/macOS
-                subprocess.run(["lp", pdf_path], check=True)
+        # Check if the printer is ready
+        if not is_printer_ready(selected_printer):
+            logging.error("Printer is not ready")
+            return
 
-            logging.info("Printed successfully")
-        except Exception as e:
-            logging.error(f"Print failed: {e}")
+        # Send print command using win32print
+        print_action(selected_printer, pdf_path)
 
         queue.task_done()  # Mark as done
 
@@ -90,7 +120,6 @@ async def print_html(browser):
         logging.error(f"Error in print_html: {e}")
         raise
 
-
 # Process each print job in order
 async def process_queue(browser):
     while True:
@@ -98,14 +127,19 @@ async def process_queue(browser):
         logging.info(f"Processing: {data}")
 
         try:
-            # Create HTML file from JSON
-            await create_html(data)
+            data_type = data.get("type")
+            if data_type == "x":
+                await create_html(data["value"])
+            elif data_type == "y":
+                await process_type_y(data["value"])
+            else:
+                logging.error(f"Unknown data type: {data_type}")
+                continue
 
             # Await print_html coroutine
             await print_html(browser)
         except Exception as e:
             logging.error(f"Error processing queue: {e}")
-
 
 def on_message(client, userdata, msg):
     try:
@@ -117,7 +151,6 @@ def on_message(client, userdata, msg):
 
     except Exception as e:
         logging.error(f"Error processing message: {e}")
-
 
 def mqtt_thread_exception_handler(args):
     logging.error(f"Exception in thread {args.thread.name}: {args.exc_type.__name__}: {args.exc_value}")
@@ -132,7 +165,6 @@ async def mqtt_subscribe():
     client.connect(MQTT_BROKER, 1883, 60)
     client.loop_start()  # Run MQTT in a separate thread
     logging.info("MQTT client started...")
-
 
 async def main():
     global loop
@@ -153,7 +185,6 @@ async def main():
         logging.error(f"Error in main: {e}")
     finally:
         await browser.close()
-
 
 # Check if there is an event loop, avoid "asyncio.run() cannot be called..."
 try:
